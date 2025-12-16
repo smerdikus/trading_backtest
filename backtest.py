@@ -1,108 +1,33 @@
-"""
-Minimal OHLC backtest engine (long + short) with SL/TP intrabar execution.
-
-Key ideas we agreed on:
-- Long/short is inferred from SL/TP ordering:
-    S = sign(tp - sl)  ->  +1 long (tp>sl), -1 short (tp<sl)
-- Use "signed space" to unify logic:
-    p' = S * p
-    pmin = min(S*low, S*high), pmax = max(S*low, S*high)
-    SL hit: pmin <= sl'
-    TP hit: pmax >= tp'
-- One position at a time.
-- Entry is "market" on bar close or next bar open (or optional explicit entry price in `buy`).
-
-Input bars: list[dict] with at least:
-  time, open, high, low, close
-  buy (bool/int/float)   # signal; if numeric > 0 => explicit entry price
-  sl (float), tp (float)
-
-Output:
-  trades: list[Trade]
-  final_bankroll: float
-"""
-
 from __future__ import annotations
-
-from dataclasses import dataclass, asdict
-from typing import Any, Dict, List, Literal, Optional, Tuple
 import math
-
-
-@dataclass(frozen=True)
-class Trade:
-    side: int  # +1 long, -1 short
-    entry_time: Any
-    exit_time: Any
-    entry: float
-    exit: float
-    sl: float
-    tp: float
-    qty: float
-    pnl: float
-    win: bool
-    reason: Literal["sl", "tp", "eod"]
-
-
-@dataclass
-class _Position:
-    S: int
-    entry_time: Any
-    entry_raw: float
-    entry_s: float
-    sl_raw: float
-    tp_raw: float
-    sl_s: float
-    tp_s: float
+import pandas as pd
 
 
 class Backtester:
-    def __init__(
-        self,
-        *,
-        qty: float = 1.0,
-        entry_mode: Literal["close", "next_open"] = "close",
-        both_hit: Literal["sl_first", "tp_first"] = "sl_first",
-        time_col: str = "time",
-        open_col: str = "open",
-        high_col: str = "high",
-        low_col: str = "low",
-        close_col: str = "close",
-        buy_col: str = "buy",
-        sl_col: str = "sl",
-        tp_col: str = "tp",
-    ):
-        if qty <= 0:
-            raise ValueError("qty must be > 0")
-        self.qty = float(qty)
+    """
+    Pandas backtest engine:
+    - long/short inferred from SL/TP ordering: S = sign(tp - sl)
+    - intrabar SL/TP using high/low in signed space
+    - 1 position at a time
+    - entry = close | next_open OR explicit entry price if buy is numeric (>0)
+    - run(df) returns trades_df with: time, won, sl, tp, r_mult, reason
+    - evaluate(trades_df) reconstructs bankroll curve from r_mult only
+    """
+
+    def __init__(self, entry_mode: str = "close", both_hit: str = "sl_first"):
         self.entry_mode = entry_mode
         self.both_hit = both_hit
 
-        self.time_col = time_col
-        self.open_col = open_col
-        self.high_col = high_col
-        self.low_col = low_col
-        self.close_col = close_col
-        self.buy_col = buy_col
-        self.sl_col = sl_col
-        self.tp_col = tp_col
+    @staticmethod
+    def _sgn(x: float) -> int:
+        return 1 if x > 0 else (-1 if x < 0 else 0)
 
-    # -------- core helpers (signed-space) --------
-    def _signed_range(self, bar: Dict[str, Any], S: int) -> Tuple[float, float]:
-        lo = float(bar[self.low_col])
-        hi = float(bar[self.high_col])
-        a = S * lo
-        b = S * hi
-        return (a, b) if a <= b else (b, a)  # pmin, pmax
-
-    def _choose_reason(self, hit_sl: bool, hit_tp: bool) -> Literal["sl", "tp"]:
-        if hit_sl and hit_tp:
-            return "sl" if self.both_hit == "sl_first" else "tp"
-        return "sl" if hit_sl else "tp"
-
-    def _is_explicit_price(self, x: Any) -> bool:
-        # allow numeric entry in buy (e.g., 123.45); exclude bools
-        if isinstance(x, bool) or x is None:
+    @staticmethod
+    def _is_price(x) -> bool:
+        # numeric positive, but not bool
+        if x is None:
+            return False
+        if isinstance(x, bool):
             return False
         try:
             v = float(x)
@@ -110,164 +35,179 @@ class Backtester:
         except Exception:
             return False
 
-    # -------- order/position logic --------
-    def _make_position(self, bars: List[Dict[str, Any]], i: int) -> Optional[_Position]:
-        bar = bars[i]
+    def run(
+        self,
+        df: pd.DataFrame,
+        *,
+        time_col="time",
+        open_col="open",
+        high_col="high",
+        low_col="low",
+        close_col="close",
+        buy_col="buy",
+        sl_col="sl",
+        tp_col="tp",
+    ) -> pd.DataFrame:
+        d = df.reset_index(drop=True)
 
-        buy = bar.get(self.buy_col, False)
-        if not buy:
-            return None
+        trades = []
+        pos = None  # dict with S, entry, denom, sl, tp, sl_s, tp_s, entry_time
 
-        sl = bar.get(self.sl_col, None)
-        tp = bar.get(self.tp_col, None)
-        if sl is None or tp is None:
-            return None
+        def signed_range(row, S: int):
+            a = S * float(getattr(row, low_col))
+            b = S * float(getattr(row, high_col))
+            return (a, b) if a <= b else (b, a)
 
-        sl = float(sl)
-        tp = float(tp)
+        def choose_reason(hit_sl: bool, hit_tp: bool) -> str:
+            if hit_sl and hit_tp:
+                return "sl" if self.both_hit == "sl_first" else "tp"
+            return "sl" if hit_sl else "tp"
 
-        diff = tp - sl
-        if diff == 0:
-            return None
-        S = 1 if diff > 0 else -1  # +1 long, -1 short
+        def open_position(i: int, row):
+            buy = getattr(row, buy_col)
+            if not bool(buy):
+                return None
 
-        # entry price
-        if self._is_explicit_price(buy):
-            entry_raw = float(buy)
-            entry_time = bar[self.time_col]
-        else:
-            if self.entry_mode == "close":
-                entry_raw = float(bar[self.close_col])
-                entry_time = bar[self.time_col]
-            else:  # next_open
-                if i + 1 >= len(bars):
-                    return None
-                entry_raw = float(bars[i + 1][self.open_col])
-                entry_time = bars[i + 1][self.time_col]
+            sl = getattr(row, sl_col)
+            tp = getattr(row, tp_col)
+            if pd.isna(sl) or pd.isna(tp):
+                return None
 
-        entry_s = S * entry_raw
-        sl_s = S * sl
-        tp_s = S * tp
+            sl = float(sl)
+            tp = float(tp)
 
-        # unified validity check: SL' < entry' < TP'
-        if not (sl_s < entry_s < tp_s):
-            return None
+            S = self._sgn(tp - sl)  # +1 long, -1 short
+            if S == 0:
+                return None
 
-        return _Position(
-            S=S,
-            entry_time=entry_time,
-            entry_raw=entry_raw,
-            entry_s=entry_s,
-            sl_raw=sl,
-            tp_raw=tp,
-            sl_s=sl_s,
-            tp_s=tp_s,
-        )
+            # entry price
+            if self._is_price(buy):
+                entry = float(buy)
+                entry_time = getattr(row, time_col)
+            else:
+                if self.entry_mode == "close":
+                    entry = float(getattr(row, close_col))
+                    entry_time = getattr(row, time_col)
+                else:
+                    if i + 1 >= len(d):
+                        return None
+                    entry = float(d.loc[i + 1, open_col])
+                    entry_time = d.loc[i + 1, time_col]
 
-    def _try_exit(self, bars: List[Dict[str, Any]], i: int, pos: _Position) -> Optional[Tuple[str, float]]:
-        bar = bars[i]
-        pmin, pmax = self._signed_range(bar, pos.S)
+            entry_s = S * entry
+            sl_s = S * sl
+            tp_s = S * tp
 
-        hit_sl = (pmin <= pos.sl_s)
-        hit_tp = (pmax >= pos.tp_s)
-        if not (hit_sl or hit_tp):
-            return None
+            # unified validity: SL' < entry' < TP'
+            if not (sl_s < entry_s < tp_s):
+                return None
 
-        reason = self._choose_reason(hit_sl, hit_tp)
-        exit_s = pos.sl_s if reason == "sl" else pos.tp_s
-        exit_raw = exit_s / pos.S
-        return reason, float(exit_raw)
+            denom = (entry - sl)
+            if denom == 0:
+                return None
 
-    # -------- public API --------
-    def run(self, bars: List[Dict[str, Any]], bankroll: float) -> Tuple[List[Trade], float]:
-        if bankroll <= 0:
-            raise ValueError("bankroll must be > 0")
-        if not bars:
-            return [], float(bankroll)
+            return {
+                "S": S,
+                "entry": entry,
+                "entry_time": entry_time,
+                "denom": denom,
+                "sl": sl,
+                "tp": tp,
+                "sl_s": sl_s,
+                "tp_s": tp_s,
+            }
 
-        # minimal schema check (first row)
-        required = [self.time_col, self.open_col, self.high_col, self.low_col, self.close_col]
-        for k in required:
-            if k not in bars[0]:
-                raise ValueError(f"Missing required column '{k}' in bars[0]")
+        def try_exit(i: int, row, pos):
+            S = pos["S"]
+            pmin, pmax = signed_range(row, S)
+            hit_sl = (pmin <= pos["sl_s"])
+            hit_tp = (pmax >= pos["tp_s"])
+            if not (hit_sl or hit_tp):
+                return None
+            reason = choose_reason(hit_sl, hit_tp)
+            exit_s = pos["sl_s"] if reason == "sl" else pos["tp_s"]
+            exit_price = exit_s / S
+            exit_time = getattr(row, time_col)
+            return reason, float(exit_price), exit_time
 
-        trades: List[Trade] = []
-        pos: Optional[_Position] = None
-
-        for i in range(len(bars)):
-            bar = bars[i]
-
-            # 1) Exit has priority
+        # iterate rows (stateful engine)
+        for i, row in enumerate(d.itertuples(index=False)):
+            # EXIT first
             if pos is not None:
-                out = self._try_exit(bars, i, pos)
+                out = try_exit(i, row, pos)
                 if out is not None:
-                    reason, exit_raw = out
-                    pnl = (exit_raw - pos.entry_raw) * self.qty * pos.S
-                    bankroll += pnl
-
+                    reason, exit_price, exit_time = out
+                    r_mult = (exit_price - pos["entry"]) / pos["denom"]
                     trades.append(
-                        Trade(
-                            side=pos.S,
-                            entry_time=pos.entry_time,
-                            exit_time=bar[self.time_col],
-                            entry=pos.entry_raw,
-                            exit=exit_raw,
-                            sl=pos.sl_raw,
-                            tp=pos.tp_raw,
-                            qty=self.qty,
-                            pnl=pnl,
-                            win=pnl > 0,
-                            reason=reason,  # "sl" or "tp"
-                        )
+                        {
+                            "time": exit_time,
+                            "won": bool(r_mult > 0),
+                            "sl": pos["sl"],
+                            "tp": pos["tp"],
+                            "r_mult": float(r_mult),
+                            "reason": reason,  # sl|tp
+                        }
                     )
                     pos = None
-                    continue  # don't open a new trade in the same bar
+                    continue
 
-            # 2) Entry (only if flat)
+            # ENTRY if flat
             if pos is None:
-                pos = self._make_position(bars, i)
+                pos = open_position(i, row)
 
-        # 3) EOD close for open position
+        # EOD close
         if pos is not None:
-            last = bars[-1]
-            exit_raw = float(last[self.close_col])
-            pnl = (exit_raw - pos.entry_raw) * self.qty * pos.S
-            bankroll += pnl
+            last_close = float(d.loc[len(d) - 1, close_col])
+            last_time = d.loc[len(d) - 1, time_col]
+            r_mult = (last_close - pos["entry"]) / pos["denom"]
             trades.append(
-                Trade(
-                    side=pos.S,
-                    entry_time=pos.entry_time,
-                    exit_time=last[self.time_col],
-                    entry=pos.entry_raw,
-                    exit=exit_raw,
-                    sl=pos.sl_raw,
-                    tp=pos.tp_raw,
-                    qty=self.qty,
-                    pnl=pnl,
-                    win=pnl > 0,
-                    reason="eod",
-                )
+                {
+                    "time": last_time,
+                    "won": bool(r_mult > 0),
+                    "sl": pos["sl"],
+                    "tp": pos["tp"],
+                    "r_mult": float(r_mult),
+                    "reason": "eod",
+                }
             )
 
-        return trades, float(bankroll)
+        return pd.DataFrame(trades, columns=["time", "won", "sl", "tp", "r_mult", "reason"])
 
     @staticmethod
-    def trades_to_dicts(trades: List[Trade]) -> List[Dict[str, Any]]:
-        return [asdict(t) for t in trades]
+    def evaluate(trades_df: pd.DataFrame, initial_bankroll: float, risk_fraction: float = 0.01) -> pd.DataFrame:
+        """
+        bankroll_{k+1} = bankroll_k * (1 + risk_fraction * r_mult_k)
+        => bankroll = initial * cumprod(1 + risk_fraction * r_mult)
+        """
+        if trades_df is None or len(trades_df) == 0:
+            return pd.DataFrame(columns=["time", "bankroll"])
+
+        m = trades_df["r_mult"].astype(float).to_numpy()
+        factors = 1.0 + float(risk_fraction) * m
+        bankroll = float(initial_bankroll) * pd.Series(factors).cumprod()
+
+        out = pd.DataFrame({"time": trades_df["time"].values, "bankroll": bankroll.values})
+        return out
 
 
 if __name__ == "__main__":
-    # Tiny demo
     bars = [
         {"time": "t0", "open": 100, "high": 101, "low":  99, "close": 100, "buy": False, "sl": None, "tp": None},
-        {"time": "t1", "open": 100, "high": 102, "low":  98, "close": 101, "buy": True,  "sl": 95,   "tp": 110},  # long signal (tp>sl)
-        {"time": "t2", "open": 101, "high": 110, "low":  90, "close": 104, "buy": False, "sl": None, "tp": None},
-        {"time": "t3", "open": 104, "high": 111, "low": 103, "close": 110, "buy": False, "sl": None, "tp": None},  # TP hit
+        {"time": "t1", "open": 100, "high": 102, "low":  98, "close": 101, "buy": True,  "sl": 95,   "tp": 110},  # long signal
+        {"time": "t2", "open": 101, "high": 110, "low":  90, "close": 104, "buy": False, "sl": None, "tp": None},  # long SL+TP hit -> SL first
+        {"time": "t3", "open": 104, "high": 106, "low": 103, "close": 104, "buy": False, "sl": None, "tp": None},
+        {"time": "t4", "open": 104, "high": 108, "low": 100, "close": 104, "buy": True,  "sl": 114,  "tp": 84},   # short signal
+        {"time": "t5", "open": 104, "high": 109, "low":  80, "close":  92, "buy": False, "sl": None, "tp": None},  # short TP
+        {"time": "t6", "open":  92, "high":  95, "low":  90, "close":  94, "buy": False, "sl": None, "tp": None},
     ]
 
-    bt = Backtester(qty=1.0, entry_mode="close", both_hit="sl_first")
-    trades, final_bankroll = bt.run(bars, bankroll=10_000)
 
-    print("Final bankroll:", final_bankroll)
-    for t in trades:
-        print(t)
+    df = pd.DataFrame(bars)
+
+    bt = Backtester(entry_mode="close", both_hit="sl_first")
+    trades = bt.run(df)
+    print("TRADES\n", trades)
+
+    curve = bt.evaluate(trades, initial_bankroll=10_000, risk_fraction=0.01)
+    print("\nCURVE\n", curve)
+
